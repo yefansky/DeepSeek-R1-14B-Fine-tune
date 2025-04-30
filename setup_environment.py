@@ -104,7 +104,9 @@ def build_curl_lib():
         cmake_cmd = [
             "cmake",
             f"../{extract_dir}",
-            "-DBUILD_SHARED_LIBS=OFF",  # 静态库
+            "-DBUILD_SHARED_LIBS=ON",  # 静态库
+            "-DBUILD_STATIC_LIBS=OFF",
+            "-DCURL_STATICLIB=ON",
             "-DCMAKE_BUILD_TYPE=Release",
             "-DCURL_DISABLE_LIBIDN2=ON",  # 禁用libidn2
             "-DCURL_USE_LIBPSL=OFF",     # 明确禁用libpsl
@@ -132,7 +134,7 @@ def build_curl_lib():
         # 清理：返回原始目录并删除下载的tar文件
         os.chdir("..")
         if os.path.exists(filename):
-            os.remove(filename)            
+            os.remove(filename)       
 
 def setup_llama_cpp():
     """设置llama.cpp"""
@@ -149,7 +151,8 @@ def setup_llama_cpp():
     
     # 设置 CURL 路径（使用绝对路径）
     curl_include_dir = os.path.abspath(os.path.join(CURL_DIR_INCLUDE))
-    curl_library = os.path.abspath(os.path.join(CURL_DIR_LIB, "libcurl.lib"))
+    # curl_library = os.path.abspath(os.path.join(CURL_DIR_LIB, "libcurl.lib"))
+    curl_library = os.path.abspath(os.path.join(CURL_DIR_LIB, "libcurl_imp.lib"))
     
     # 验证路径
     if not os.path.exists(curl_include_dir):
@@ -170,7 +173,7 @@ def setup_llama_cpp():
                         "-DGGML_CUDA=ON", 
                         "-DCMAKE_GENERATOR_TOOLSET='cuda=C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8'",
                         f"-DCURL_INCLUDE_DIR={curl_include_dir}",
-                        f"-DCURL_LIBRARY={curl_library}"
+                        f"-DCURL_LIBRARY={curl_library}",
                         ], cwd=build_dir, check=True)
         subprocess.run(["cmake", "--build", ".", "--config", "Release"], cwd=build_dir, check=True)
     except subprocess.CalledProcessError as e:
