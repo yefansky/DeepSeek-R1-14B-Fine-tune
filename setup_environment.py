@@ -12,6 +12,8 @@ import tarfile
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+os.environ["PYTHONUTF8"] = "1"  # 确保子进程使用 UTF-8 编码
+
 # 配置常量
 VENV_DIR = ".\\venv"
 LLAMA_CPP_DIR = ".\\llama_cpp"
