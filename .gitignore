@@ -1,0 +1,9 @@
+# Ignore everything
+*
+
+# Allow .bat and .py files
+!*.bat
+!*.py
+
+# Ignore directories
+*/
