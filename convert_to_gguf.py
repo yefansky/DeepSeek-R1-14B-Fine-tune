@@ -1,13 +1,13 @@
-# convert_to_gguf.py
+ï»¿# convert_to_gguf.py
 import os
 import subprocess
 import logging
 
-# ÅäÖÃÈÕÖ¾
+# é…ç½®æ—¥å¿—
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ÅäÖÃ³£Á¿
+# é…ç½®å¸¸é‡
 LLAMA_CPP_DIR = ".\\llama_cpp"
 GGUF_OUTPUT_DIR = ".\\gguf_model"
 QUANTIZATION_METHOD = "q4_k_m"
@@ -15,14 +15,14 @@ IMATRIX_DATA = ".\\imatrix_data.txt"
 MODEL_DIR = ".\\fine_tuned_model"
 
 def convert_to_gguf():
-    """×ª»»Ä£ĞÍÎªGGUF¸ñÊ½"""
+    """è½¬æ¢æ¨¡å‹ä¸ºGGUFæ ¼å¼"""
     if not os.path.exists(GGUF_OUTPUT_DIR):
         os.makedirs(GGUF_OUTPUT_DIR)
     
     quantize_bin = os.path.join(LLAMA_CPP_DIR, "build", "bin", "quantize.exe")
     imatrix_bin = os.path.join(LLAMA_CPP_DIR, "build", "bin", "imatrix.exe")
     
-    # 1. ×ª»»ÎªFP16
+    # 1. è½¬æ¢ä¸ºFP16
     fp16_file = os.path.join(GGUF_OUTPUT_DIR, "model-fp16.bin")
     logger.info("Converting to FP16")
     convert_script = os.path.join(LLAMA_CPP_DIR, "convert.py")
@@ -32,7 +32,7 @@ def convert_to_gguf():
         "--outtype", "f16"
     ], check=True)
     
-    # 2. Éú³Éimatrix
+    # 2. ç”Ÿæˆimatrix
     imatrix_output = os.path.join(GGUF_OUTPUT_DIR, "imatrix.dat")
     logger.info("Generating imatrix")
     subprocess.run([
@@ -41,7 +41,7 @@ def convert_to_gguf():
         "-o", imatrix_output
     ], check=True)
     
-    # 3. Á¿»¯Ä£ĞÍ
+    # 3. é‡åŒ–æ¨¡å‹
     gguf_file = os.path.join(GGUF_OUTPUT_DIR, f"model-{QUANTIZATION_METHOD}.gguf")
     logger.info(f"Quantizing to {QUANTIZATION_METHOD}")
     subprocess.run([
@@ -53,7 +53,7 @@ def convert_to_gguf():
     logger.info(f"GGUF model saved to {gguf_file}")
 
 def main():
-    """Ö÷º¯Êı"""
+    """ä¸»å‡½æ•°"""
     logger.info("Starting GGUF conversion")
     convert_to_gguf()
     logger.info("GGUF conversion completed")

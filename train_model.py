@@ -1,4 +1,4 @@
-# train_model.py
+ï»¿# train_model.py
 import os
 import torch
 from unsloth import FastLanguageModel
@@ -9,11 +9,11 @@ from transformers import TrainingArguments
 import logging
 import json
 
-# ÅäÖÃÈÕÖ¾
+# é…ç½®æ—¥å¿—
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ÅäÖÃ³£Á¿
+# é…ç½®å¸¸é‡
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
 DATASET_NAME = "Trelis/function_calling_extended"
 OUTPUT_DIR = ".\\fine_tuned_model"
@@ -25,7 +25,7 @@ LEARNING_RATE = 2e-5
 EPOCHS = 3
 
 def load_model_and_tokenizer():
-    """¼ÓÔØÄ£ĞÍºÍtokenizer"""
+    """åŠ è½½æ¨¡å‹å’Œtokenizer"""
     logger.info(f"Loading model {MODEL_NAME}")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_NAME,
@@ -37,7 +37,7 @@ def load_model_and_tokenizer():
     return model, tokenizer
 
 def prepare_lora_config():
-    """×¼±¸LoRAÅäÖÃ"""
+    """å‡†å¤‡LoRAé…ç½®"""
     return LoraConfig(
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
@@ -48,19 +48,19 @@ def prepare_lora_config():
     )
 
 def prepare_dataset():
-    """×¼±¸Êı¾İ¼¯"""
+    """å‡†å¤‡æ•°æ®é›†"""
     logger.info(f"Loading dataset {DATASET_NAME}")
     dataset = load_dataset(DATASET_NAME, split="train")
     
     def format_function(example):
-        # ÕâÀïÌí¼ÓÄãµÄÊı¾İ¸ñÊ½»¯Âß¼­
+        # è¿™é‡Œæ·»åŠ ä½ çš„æ•°æ®æ ¼å¼åŒ–é€»è¾‘
         return example
     
     dataset = dataset.map(format_function)
     return dataset
 
 def train(model, tokenizer, dataset):
-    """ÑµÁ·Ä£ĞÍ"""
+    """è®­ç»ƒæ¨¡å‹"""
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         per_device_train_batch_size=BATCH_SIZE,
@@ -94,7 +94,7 @@ def train(model, tokenizer, dataset):
     tokenizer.save_pretrained(OUTPUT_DIR)
 
 def main():
-    """Ö÷º¯Êı"""
+    """ä¸»å‡½æ•°"""
     logger.info("Starting training process")
     model, tokenizer = load_model_and_tokenizer()
     dataset = prepare_dataset()
