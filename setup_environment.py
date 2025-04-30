@@ -149,7 +149,7 @@ def setup_llama_cpp():
     
     # 设置 CURL 路径（使用绝对路径）
     curl_include_dir = os.path.abspath(os.path.join(CURL_DIR_INCLUDE))
-    curl_library = os.path.abspath(os.path.join(CURL_DIR_LIB), "libcurl.lib")
+    curl_library = os.path.abspath(os.path.join(CURL_DIR_LIB, "libcurl.lib"))
     
     # 验证路径
     if not os.path.exists(curl_include_dir):
