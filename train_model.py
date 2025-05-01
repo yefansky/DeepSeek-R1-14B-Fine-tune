@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 # 配置常量
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
-DATASET_NAME = "Trelis/function_calling_extended"
+DATASET_NAME = "Jofthomas/hermes-function-calling-thinking-V1"
 OUTPUT_DIR = ".\\fine_tuned_model"
 MAX_SEQ_LENGTH = 32768
 LORA_RANK = 16
