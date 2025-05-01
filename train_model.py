@@ -96,19 +96,30 @@ def prepare_dataset():
     logger.info(f"Loading dataset {DATASET_NAME}")
     dataset = load_dataset(DATASET_NAME, split="train")
     
-    # 打印样本以检查字段
-    logger.info(f"Dataset sample: {dataset[0]}")
+    def format_conversation(example):
+        """处理单条对话样本"""
+        formatted_text = ""
+        for msg in example["conversations"]:  # 直接访问当前样本的conversations字段
+            if msg["role"] == "system":
+                formatted_text += f"<system>\n{msg['content']}\n</system>\n"
+            elif msg["role"] == "human":
+                formatted_text += f"<user>\n{msg['content']}\n</user>\n"
+            elif msg["role"] == "model":
+                formatted_text += f"<assistant>\n{msg['content']}\n</assistant>\n"
+            elif msg["role"] == "tool":
+                formatted_text += f"{msg['content']}\n"
+        return {"text": formatted_text}
     
-    def format_function(example):
-        instruction = example.get("instruction", "")
-        input_text = example.get("input", "")
-        output_text = example.get("output", "")
-        text = f"Instruction: {instruction}\nInput: {input_text}\nOutput: {output_text}"
-        logger.info(f"Formatted example: {text}")
-        return {"text": text}
+    # 打印原始样本
+    logger.info(f"原始样本结构:\n{dataset[0]}")
     
-    dataset = dataset.map(format_function)
-    return dataset
+    # 先处理数据集再获取样本
+    formatted_dataset = dataset.map(format_conversation)
+    
+    # 打印处理后的样本
+    logger.info(f"\n处理后的样本:\n{formatted_dataset[0]['text']}")
+    
+    return formatted_dataset
 
 def train(model, tokenizer, dataset):
     """训练模型"""
@@ -131,11 +142,8 @@ def train(model, tokenizer, dataset):
     )
     
     def formatting_func(example):
-        instruction = example.get("instruction", "")
-        input_text = example.get("input", "")
-        output_text = example.get("output", "")
-        text = f"Instruction: {instruction}\nInput: {input_text}\nOutput: {output_text}"
-        return {"text": text}
+        # 直接返回已经处理好的文本
+        return {"text": example["text"]}
     
     trainer = SFTTrainer(
         model=model,
