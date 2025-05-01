@@ -38,7 +38,9 @@ REQUIREMENTS = [
     
     "xformers",
     #"triton"
-    "triton-windows"
+    "triton-windows",
+
+    "huggingface_hub[hf_xet]"
 ]
 
 def create_venv():
