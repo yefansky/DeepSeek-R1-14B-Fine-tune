@@ -30,7 +30,15 @@ REQUIREMENTS = [
     "huggingface_hub",
     "flask",
     "gitpython",
-    "torch"
+    #"torch",
+
+    "torch",
+    "torchvision",
+    "torchaudio",
+    
+    "xformers",
+    #"triton"
+    "triton-windows"
 ]
 
 def create_venv():
@@ -68,10 +76,19 @@ def install_dependencies():
         logger.error("Virtual environment pip not found")
         sys.exit(1)
     
+    # 先卸载旧版本（可选）
+    # subprocess.run([venv_pip, "uninstall", "torch", "torchvision", "torchaudio", "-y"], check=False)
+    
     for package in REQUIREMENTS:
         logger.info(f"Installing {package}")
         try:
-            subprocess.run([venv_pip, "install", package], check=True)
+            if package.startswith("torch"):
+                subprocess.run([venv_pip, "install", package, "--index-url", "https://download.pytorch.org/whl/cu128"], check=True)
+            #elif package.startswith("triton"):
+                # 单独处理 triton 的安装
+                #subprocess.run([venv_pip, "install", "-f", "triton-nightly", "--index-url", "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/"], check=True)
+            else:
+                subprocess.run([venv_pip, "install", package], check=True)
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to install {package}: {str(e)}")
             sys.exit(1)
