@@ -31,7 +31,8 @@ def load_model_and_tokenizer():
         model_name=MODEL_NAME,
         max_seq_length=MAX_SEQ_LENGTH,
         dtype=torch.bfloat16,
-        load_in_4bit=True
+        load_in_4bit=True,
+        resume_download=True
     )
     logger.info("Model and tokenizer loaded successfully")
     return model, tokenizer
