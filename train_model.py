@@ -18,8 +18,8 @@ MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
 DATASET_NAME = "Jofthomas/hermes-function-calling-thinking-V1"
 OUTPUT_DIR = ".\\fine_tuned_model"
 MAX_SEQ_LENGTH = 32768
-LORA_RANK = 16
-LORA_ALPHA = 32
+LORA_RANK = 32
+LORA_ALPHA = 64
 BATCH_SIZE = 2
 LEARNING_RATE = 2e-5
 EPOCHS = 3
@@ -41,7 +41,7 @@ def prepare_lora_config():
     return LoraConfig(
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM"
@@ -72,7 +72,12 @@ def train(model, tokenizer, dataset):
         fp16=False,
         bf16=True,
         save_strategy="steps",
-        save_total_limit=2
+        save_total_limit=2,
+
+        optim="adamw_bnb_8bit",  # 8-bit 优化器
+        lr_scheduler_type="cosine",  # 学习率调度
+        warmup_steps=100,
+        max_grad_norm=1.0,  # 梯度裁剪
     )
     
     trainer = SFTTrainer(
