@@ -1,5 +1,4 @@
-﻿# train_model.py
-import os
+﻿import os
 import torch
 from unsloth import FastLanguageModel
 from datasets import load_dataset
@@ -8,6 +7,7 @@ from trl import SFTTrainer
 from transformers import TrainingArguments
 import logging
 import json
+import time
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,18 +24,61 @@ BATCH_SIZE = 2
 LEARNING_RATE = 2e-5
 EPOCHS = 3
 
-def load_model_and_tokenizer():
-    """加载模型和tokenizer"""
+def load_model_and_tokenizer(max_retries=300, retry_delay=5):
+    """加载模型和tokenizer，并应用LoRA适配器"""
     logger.info(f"Loading model {MODEL_NAME}")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=MODEL_NAME,
-        max_seq_length=MAX_SEQ_LENGTH,
-        dtype=torch.bfloat16,
-        load_in_4bit=True,
-        resume_download=True
-    )
-    logger.info("Model and tokenizer loaded successfully")
-    return model, tokenizer
+    for attempt in range(1, max_retries + 1):
+        try:
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=MODEL_NAME,
+                max_seq_length=MAX_SEQ_LENGTH,
+                dtype=torch.bfloat16,
+                load_in_4bit=True,
+                resume_download=True
+            )
+            logger.info("Model and tokenizer loaded successfully")
+
+            # 应用LoRA适配器
+            logger.info("Applying LoRA adapters")
+            model = FastLanguageModel.get_peft_model(
+                model,
+                r=LORA_RANK,
+                lora_alpha=LORA_ALPHA,
+                lora_dropout=0.05,
+                bias="none",
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                use_gradient_checkpointing=True,
+                random_state=3407,
+                max_seq_length=MAX_SEQ_LENGTH
+            )
+            logger.info("LoRA adapters applied successfully")
+
+            # 打印可训练参数
+            logger.info("Trainable parameters:")
+            trainable_params = 0
+            total_params = 0
+            for name, param in model.named_parameters():
+                total_params += param.numel()
+                if param.requires_grad:
+                    trainable_params += param.numel()
+                    logger.info(f" - {name}: {param.shape}")
+            logger.info(f"Total parameters: {total_params:,}")
+            logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params / total_params * 100:.2f}%)")
+
+            return model, tokenizer
+        except OSError as e:
+            logger.warning(f"Attempt {attempt} failed with OSError: {str(e)}")
+            if attempt == max_retries:
+                logger.error(f"All {max_retries} attempts failed. Final error: {str(e)}")
+                logger.error("Please check the model repository at: "
+                             "https://huggingface.co/unsloth/deepseek-r1-distill-qwen-14b-unsloth-bnb-4bit")
+                raise
+            logger.info(f"Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+        except Exception as e:
+            logger.error(f"Unexpected error during attempt {attempt}: {str(e)}")
+            raise
+    raise Exception("Failed to load model after retries")
 
 def prepare_lora_config():
     """准备LoRA配置"""
@@ -53,9 +96,16 @@ def prepare_dataset():
     logger.info(f"Loading dataset {DATASET_NAME}")
     dataset = load_dataset(DATASET_NAME, split="train")
     
+    # 打印样本以检查字段
+    logger.info(f"Dataset sample: {dataset[0]}")
+    
     def format_function(example):
-        # 这里添加你的数据格式化逻辑
-        return example
+        instruction = example.get("instruction", "")
+        input_text = example.get("input", "")
+        output_text = example.get("output", "")
+        text = f"Instruction: {instruction}\nInput: {input_text}\nOutput: {output_text}"
+        logger.info(f"Formatted example: {text}")
+        return {"text": text}
     
     dataset = dataset.map(format_function)
     return dataset
@@ -74,12 +124,18 @@ def train(model, tokenizer, dataset):
         bf16=True,
         save_strategy="steps",
         save_total_limit=2,
-
-        optim="adamw_bnb_8bit",  # 8-bit 优化器
-        lr_scheduler_type="cosine",  # 学习率调度
+        optim="adamw_bnb_8bit",
+        lr_scheduler_type="cosine",
         warmup_steps=100,
-        max_grad_norm=1.0,  # 梯度裁剪
+        max_grad_norm=1.0,
     )
+    
+    def formatting_func(example):
+        instruction = example.get("instruction", "")
+        input_text = example.get("input", "")
+        output_text = example.get("output", "")
+        text = f"Instruction: {instruction}\nInput: {input_text}\nOutput: {output_text}"
+        return {"text": text}
     
     trainer = SFTTrainer(
         model=model,
@@ -88,7 +144,8 @@ def train(model, tokenizer, dataset):
         dataset_text_field="text",
         max_seq_length=MAX_SEQ_LENGTH,
         args=training_args,
-        packing=True
+        packing=True,
+        formatting_func=formatting_func,
     )
     
     logger.info("Starting training")
