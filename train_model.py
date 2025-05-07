@@ -1,4 +1,5 @@
-﻿import os
+﻿# -*- coding: utf-8 -*-
+import os
 import torch
 from unsloth import FastLanguageModel
 from datasets import load_dataset
@@ -15,12 +16,27 @@ logger = logging.getLogger(__name__)
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
 DATASET_NAME = "Jofthomas/hermes-function-calling-thinking-V1"
 OUTPUT_DIR = os.path.join(".", "fine_tuned_model")  # 跨平台路径
-MAX_SEQ_LENGTH = 4096  # 调整为适合多段对话的长度
+MAX_SEQ_LENGTH = 4096  # 适合多段对话，RTX 5090 可支持
 LORA_RANK = 32
 LORA_ALPHA = 64
-BATCH_SIZE = 2
+BATCH_SIZE = 4  # 增加 batch size，利用 RTX 5090 的 VRAM
 LEARNING_RATE = 2e-5
 EPOCHS = 3
+
+# Qwen 的默认 chat_template
+QWen_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}"
+    "<|im_start|>system\n{{ message['content'] }}<|im_end|>\n"
+    "{% elif message['role'] == 'human' %}"
+    "<|im_start|>user\n{{ message['content'] }}<|im_end|>\n"
+    "{% elif message['role'] == 'model' %}"
+    "<|im_start|>assistant\n{{ message['content'] }}<|im_end|>\n"
+    "{% elif message['role'] == 'tool' %}"
+    "<|im_start|>tool\n{{ message['content'] }}<|im_end|>\n"
+    "{% endif %}"
+    "{% endfor %}"
+)
 
 def load_model_and_tokenizer(max_retries=300, retry_delay=5):
     """加载模型和tokenizer，并应用LoRA适配器"""
@@ -36,11 +52,18 @@ def load_model_and_tokenizer(max_retries=300, retry_delay=5):
             )
             logger.info("Model and tokenizer loaded successfully")
 
-            # 检查是否有预定义的 chat_template
-            if not hasattr(tokenizer, "chat_template") or tokenizer.chat_template is None:
-                logger.info("No chat_template found, applying default ChatML format")
-                from trl import setup_chat_format
-                model, tokenizer = setup_chat_format(model, tokenizer)
+            # 检查 tokenizer 配置
+            logger.info(f"Tokenizer EOS token: {tokenizer.eos_token}")
+            logger.info(f"Tokenizer chat template: {getattr(tokenizer, 'chat_template', None)}")
+            
+            # 确保 eos_token 正确（Qwen 预期为 <|im_end|>）
+            if tokenizer.eos_token is None or tokenizer.eos_token != "<|im_end|>":
+                logger.warning("EOS token is missing or incorrect, setting to <|im_end|>")
+                tokenizer.eos_token = "<|im_end|>"
+
+            # 设置 Qwen 的 chat_template
+            logger.info("Setting Qwen chat_template")
+            tokenizer.chat_template = QWen_CHAT_TEMPLATE
 
             # 应用LoRA适配器
             logger.info("Applying LoRA adapters")
@@ -51,7 +74,7 @@ def load_model_and_tokenizer(max_retries=300, retry_delay=5):
                 lora_dropout=0.05,
                 bias="none",
                 target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-                modules_to_save=["lm_head", "embed_tokens"],  # 确保支持特殊标记
+                modules_to_save=["lm_head", "embed_tokens"],  # 支持特殊标记
                 use_gradient_checkpointing=True,
                 random_state=3407,
                 max_seq_length=MAX_SEQ_LENGTH
@@ -85,6 +108,40 @@ def prepare_dataset():
     logger.info(f"Dataset sample: {dataset[0]}")
     return dataset
 
+def preprocess_dataset(dataset, tokenizer):
+    """预处理数据集，将 conversations 转换为 text 字段"""
+    def format_conversation(example):
+        if "conversations" not in example:
+            logger.error("Example missing 'conversations' field")
+            return {"text": None}
+        
+        conversation = example["conversations"]
+        if not isinstance(conversation, list) or not conversation:
+            logger.warning(f"Invalid conversation format in example: {example}")
+            return {"text": None}
+        
+        # 转换为 messages 格式
+        messages = [{"role": msg["role"], "content": msg["content"]} for msg in conversation]
+        
+        # 调试：记录 messages
+        logger.debug(f"Messages for example: {messages}")
+        
+        # 使用 tokenizer 的 chat_template 格式化
+        try:
+            formatted_text = tokenizer.apply_chat_template(messages, tokenize=False)
+            logger.debug(f"Formatted text: {formatted_text}")
+            return {"text": formatted_text}
+        except Exception as e:
+            logger.error(f"Error applying chat_template: {str(e)}")
+            return {"text": None}
+
+    logger.info("Preprocessing dataset")
+    processed_dataset = dataset.map(format_conversation, remove_columns=["conversations"])
+    processed_dataset = processed_dataset.filter(lambda x: x["text"] is not None)
+    logger.info(f"Processed dataset size: {len(processed_dataset)}")
+    logger.info(f"Processed dataset sample: {processed_dataset[0]}")
+    return processed_dataset
+
 def train(model, tokenizer, dataset):
     """训练模型"""
     training_args = SFTConfig(
@@ -96,20 +153,17 @@ def train(model, tokenizer, dataset):
         logging_steps=10,
         save_steps=100,
         fp16=False,
-        bf16=True,
+        bf16=True,  # RTX 5090 支持 bf16
         save_strategy="steps",
         save_total_limit=2,
         optim="adamw_bnb_8bit",
         lr_scheduler_type="cosine",
         warmup_steps=100,
         max_grad_norm=1.0,
-        packing=True,  # 启用打包
-        eval_packing=False,  # 验证集不打包
+        packing=False,  # 禁用打包以简化调试
         max_seq_length=MAX_SEQ_LENGTH,
-        eos_token="<|im_end|>",  # 设置 Qwen 的 EOS 标记
-        neftune_noise_alpha=5,  # 添加 NEFTune 提升性能
-        dataset_kwargs={"skip_prepare_dataset": True},  # 跳过默认数据集处理
-        remove_unused_columns=False,  # 保留 messages 字段
+        neftune_noise_alpha=5,  # 提升对话性能
+        dataset_text_field="text",  # 指定 text 字段
     )
 
     trainer = SFTTrainer(
@@ -117,7 +171,7 @@ def train(model, tokenizer, dataset):
         tokenizer=tokenizer,
         train_dataset=dataset,
         args=training_args,
-        packing=True,  # 确保与 SFTConfig 一致
+        dataset_text_field="text",  # 使用预处理的 text 字段
     )
 
     logger.info("Starting training")
@@ -133,7 +187,8 @@ def main():
     logger.info("Starting training process")
     model, tokenizer = load_model_and_tokenizer()
     dataset = prepare_dataset()
-    train(model, tokenizer, dataset)
+    processed_dataset = preprocess_dataset(dataset, tokenizer)
+    train(model, tokenizer, processed_dataset)
     logger.info("Training process completed successfully")
 
 if __name__ == "__main__":
