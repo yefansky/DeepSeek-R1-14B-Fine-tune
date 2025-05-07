@@ -1,21 +1,63 @@
-import json  # 添加这行导入
+import json
+import os
+import shutil
 import torch
 from unsloth import FastLanguageModel
 from transformers import AutoTokenizer
 
+def create_temp_model_dir(original_path, temp_path):
+    """复制模型目录到临时目录并修改 tokenizer_config.json"""
+    if os.path.exists(temp_path):
+        shutil.rmtree(temp_path)
+    shutil.copytree(original_path, temp_path)
+    
+    # 修改临时目录中的 tokenizer_config.json
+    tokenizer_config_path = os.path.join(temp_path, 'tokenizer_config.json')
+    if os.path.exists(tokenizer_config_path):
+        with open(tokenizer_config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        # 设置与训练一致的 chat_template，添加 add_generation_prompt
+        config['chat_template'] = (
+            "{% for message in messages %}"
+            "{% if message['role'] == 'system' %}<|im_start|>system\n{{ message['content'] }}<|im_end|>\n"
+            "{% elif message['role'] == 'human' %}<|im_start|>user\n{{ message['content'] }}<|im_end|>\n"
+            "{% elif message['role'] == 'model' %}<|im_start|>assistant\n{{ message['content'] }}<|im_end|>\n"
+            "{% elif message['role'] == 'tool' %}<|im_start|>tool\n{{ message['content'] }}<|im_end|>\n"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant {% endif %}"
+        )
+        
+        with open(tokenizer_config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+    else:
+        raise FileNotFoundError("未找到 tokenizer_config.json")
+
 def load_model_and_tokenizer(model_path):
+    # 加载模型和 tokenizer
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = model_path,
-        max_seq_length = 32768,
-        dtype = torch.bfloat16,
-        load_in_4bit = True,
+        model_name=model_path,
+        max_seq_length=32768,
+        dtype=torch.bfloat16,
+        load_in_4bit=True
     )
+    
+    # 调试：确认 chat_template
+    print("Tokenizer chat_template:", tokenizer.chat_template)
+    
     return model, tokenizer
 
-def generate_response(model, tokenizer, prompt):
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True).to("cuda")
+def generate_response(model, tokenizer, messages):
+    # 使用 apply_chat_template 格式化多轮对话
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt"
+    ).to("cuda")
     outputs = model.generate(
-        **inputs,
+        input_ids=inputs,
         max_new_tokens=512,
         temperature=0.3,
         do_sample=True,
@@ -74,11 +116,22 @@ def test_tool_calling(model_path):
         }
     ]
     
-    # 测试案例
+    # 系统提示，指导模型进行工具调用
+    system_prompt = f"""你是一个支持工具调用的助手。以下是可用工具的定义：
+{json.dumps(tools, indent=2, ensure_ascii=False)}
+
+请根据用户输入选择合适的工具，并以以下格式返回工具调用：
+<tool_call>{{"name": "工具名称", "arguments": {{"参数名": "参数值"}}}}</tool_call>
+
+如果无需工具调用，直接返回答案。"""
+    
+    # 测试案例（模拟多轮对话）
     test_cases = [
         {
-            "instruction": "你需要使用提供的工具来回答问题",
-            "input": "请问杭州明天的天气怎么样？",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "human", "content": "请问杭州明天的天气怎么样？"}
+            ],
             "expected": {
                 "name": "get_weather",
                 "arguments": {
@@ -88,12 +141,17 @@ def test_tool_calling(model_path):
             }
         },
         {
-            "instruction": "请使用合适的工具进行查询",
-            "input": "帮我查下纽约的天气情况",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "human", "content": "帮我查下纽约的天气情况"},
+                {"role": "model", "content": "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"纽约\"}}</tool_call>"},
+                {"role": "human", "content": "好的，那后天的天气呢？"}
+            ],
             "expected": {
                 "name": "get_weather",
                 "arguments": {
-                    "city": "纽约"
+                    "city": "纽约",
+                    "date": "后天"
                 }
             }
         }
@@ -102,16 +160,8 @@ def test_tool_calling(model_path):
     for i, case in enumerate(test_cases):
         print(f"\n=== 测试案例 {i+1} ===")
         
-        # 构建prompt
-        prompt = f"""Instruction: {case['instruction']}
-可用的工具定义：
-{json.dumps(tools, indent=2, ensure_ascii=False)}
-
-Input: {case['input']}
-Output:"""
-        
         # 生成响应
-        response = generate_response(model, tokenizer, prompt)
+        response = generate_response(model, tokenizer, case["messages"])
         print("\n完整模型输出：")
         print(response)
         
@@ -135,5 +185,11 @@ Output:"""
             print(f"\n❌ 测试失败：{str(e)}")
 
 if __name__ == "__main__":
-    model_path = "./fine_tuned_model"  # 修改为你的模型路径
-    test_tool_calling(model_path)
+    original_model_path = "./fine_tuned_model/checkpoint-100"  # 原始模型路径
+    temp_model_path = "./temp_model"  # 临时目录
+    
+    # 创建临时模型目录
+    create_temp_model_dir(original_model_path, temp_model_path)
+    
+    # 使用临时目录运行测试
+    test_tool_calling(temp_model_path)
