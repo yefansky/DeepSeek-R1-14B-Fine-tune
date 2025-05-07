@@ -38,7 +38,7 @@ QWEN_CHAT_TEMPLATE = (
 )
 
 def load_model_and_tokenizer(max_retries=3, retry_delay=5):
-    """Load model and tokenizer with LoRA adapters."""
+    """Load model and tokenizer with LoRA adapters and add special tokens."""
     logger.info(f"Loading model {MODEL_NAME}")
     for attempt in range(1, max_retries + 1):
         try:
@@ -65,6 +65,34 @@ def load_model_and_tokenizer(max_retries=3, retry_delay=5):
             if tokenizer.pad_token is None:
                 logger.warning("Pad token is missing, setting to EOS token (<|im_end|>)")
                 tokenizer.pad_token = tokenizer.eos_token
+
+            # Add special tokens
+            special_tokens = {
+                "additional_special_tokens": [
+                    "<tools>",
+                    "</tools>",
+                    "<tool_call>",
+                    "</tool_call>",
+                    "<tool_response>",
+                    "</tool_response>"
+                ]
+            }
+            logger.info("Adding special tokens to tokenizer")
+            num_added_tokens = tokenizer.add_special_tokens(special_tokens)
+            logger.info(f"Added {num_added_tokens} special tokens: {special_tokens['additional_special_tokens']}")
+
+            # Verify special tokens
+            for token in special_tokens["additional_special_tokens"]:
+                token_id = tokenizer.convert_tokens_to_ids(token)
+                logger.info(f"Token {token} assigned ID {token_id}")
+                if token_id == tokenizer.unk_token_id:
+                    logger.error(f"Token {token} was not properly added to the vocabulary")
+                    raise ValueError(f"Token {token} is treated as unknown")
+
+            # Resize model embedding layer to accommodate new tokens
+            logger.info("Resizing model token embeddings")
+            model.resize_token_embeddings(len(tokenizer))
+            logger.info(f"Model token embeddings resized to {len(tokenizer)}")
 
             # Set Qwen chat template
             logger.info("Setting Qwen chat template")
