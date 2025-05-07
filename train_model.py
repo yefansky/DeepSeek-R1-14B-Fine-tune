@@ -2,11 +2,9 @@
 import torch
 from unsloth import FastLanguageModel
 from datasets import load_dataset
-from peft import LoraConfig
-from trl import SFTTrainer
+from trl import SFTTrainer, SFTConfig
 from transformers import TrainingArguments
 import logging
-import json
 import time
 
 # 配置日志
@@ -16,8 +14,8 @@ logger = logging.getLogger(__name__)
 # 配置常量
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
 DATASET_NAME = "Jofthomas/hermes-function-calling-thinking-V1"
-OUTPUT_DIR = ".\\fine_tuned_model"
-MAX_SEQ_LENGTH = 32768
+OUTPUT_DIR = os.path.join(".", "fine_tuned_model")  # 跨平台路径
+MAX_SEQ_LENGTH = 4096  # 调整为适合多段对话的长度
 LORA_RANK = 32
 LORA_ALPHA = 64
 BATCH_SIZE = 2
@@ -38,6 +36,12 @@ def load_model_and_tokenizer(max_retries=300, retry_delay=5):
             )
             logger.info("Model and tokenizer loaded successfully")
 
+            # 检查是否有预定义的 chat_template
+            if not hasattr(tokenizer, "chat_template") or tokenizer.chat_template is None:
+                logger.info("No chat_template found, applying default ChatML format")
+                from trl import setup_chat_format
+                model, tokenizer = setup_chat_format(model, tokenizer)
+
             # 应用LoRA适配器
             logger.info("Applying LoRA adapters")
             model = FastLanguageModel.get_peft_model(
@@ -47,6 +51,7 @@ def load_model_and_tokenizer(max_retries=300, retry_delay=5):
                 lora_dropout=0.05,
                 bias="none",
                 target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                modules_to_save=["lm_head", "embed_tokens"],  # 确保支持特殊标记
                 use_gradient_checkpointing=True,
                 random_state=3407,
                 max_seq_length=MAX_SEQ_LENGTH
@@ -54,14 +59,8 @@ def load_model_and_tokenizer(max_retries=300, retry_delay=5):
             logger.info("LoRA adapters applied successfully")
 
             # 打印可训练参数
-            logger.info("Trainable parameters:")
-            trainable_params = 0
-            total_params = 0
-            for name, param in model.named_parameters():
-                total_params += param.numel()
-                if param.requires_grad:
-                    trainable_params += param.numel()
-                    logger.info(f" - {name}: {param.shape}")
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in model.parameters())
             logger.info(f"Total parameters: {total_params:,}")
             logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params / total_params * 100:.2f}%)")
 
@@ -70,8 +69,6 @@ def load_model_and_tokenizer(max_retries=300, retry_delay=5):
             logger.warning(f"Attempt {attempt} failed with OSError: {str(e)}")
             if attempt == max_retries:
                 logger.error(f"All {max_retries} attempts failed. Final error: {str(e)}")
-                logger.error("Please check the model repository at: "
-                             "https://huggingface.co/unsloth/deepseek-r1-distill-qwen-14b-unsloth-bnb-4bit")
                 raise
             logger.info(f"Retrying in {retry_delay} seconds...")
             time.sleep(retry_delay)
@@ -80,50 +77,17 @@ def load_model_and_tokenizer(max_retries=300, retry_delay=5):
             raise
     raise Exception("Failed to load model after retries")
 
-def prepare_lora_config():
-    """准备LoRA配置"""
-    return LoraConfig(
-        r=LORA_RANK,
-        lora_alpha=LORA_ALPHA,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM"
-    )
-
 def prepare_dataset():
-    """准备数据集"""
+    """加载数据集"""
     logger.info(f"Loading dataset {DATASET_NAME}")
     dataset = load_dataset(DATASET_NAME, split="train")
-    
-    def format_conversation(example):
-        """处理单条对话样本"""
-        formatted_text = ""
-        for msg in example["conversations"]:  # 直接访问当前样本的conversations字段
-            if msg["role"] == "system":
-                formatted_text += f"<system>\n{msg['content']}\n</system>\n"
-            elif msg["role"] == "human":
-                formatted_text += f"<user>\n{msg['content']}\n</user>\n"
-            elif msg["role"] == "model":
-                formatted_text += f"<assistant>\n{msg['content']}\n</assistant>\n"
-            elif msg["role"] == "tool":
-                formatted_text += f"{msg['content']}\n"
-        return {"text": formatted_text}
-    
-    # 打印原始样本
-    logger.info(f"原始样本结构:\n{dataset[0]}")
-    
-    # 先处理数据集再获取样本
-    formatted_dataset = dataset.map(format_conversation)
-    
-    # 打印处理后的样本
-    logger.info(f"\n处理后的样本:\n{formatted_dataset[0]['text']}")
-    
-    return formatted_dataset
+    logger.info(f"Dataset size: {len(dataset)}")
+    logger.info(f"Dataset sample: {dataset[0]}")
+    return dataset
 
 def train(model, tokenizer, dataset):
     """训练模型"""
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         output_dir=OUTPUT_DIR,
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=4,
@@ -139,27 +103,27 @@ def train(model, tokenizer, dataset):
         lr_scheduler_type="cosine",
         warmup_steps=100,
         max_grad_norm=1.0,
+        packing=True,  # 启用打包
+        eval_packing=False,  # 验证集不打包
+        max_seq_length=MAX_SEQ_LENGTH,
+        eos_token="<|im_end|>",  # 设置 Qwen 的 EOS 标记
+        neftune_noise_alpha=5,  # 添加 NEFTune 提升性能
+        dataset_kwargs={"skip_prepare_dataset": True},  # 跳过默认数据集处理
+        remove_unused_columns=False,  # 保留 messages 字段
     )
-    
-    def formatting_func(example):
-        # 直接返回已经处理好的文本
-        return {"text": example["text"]}
-    
+
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
-        dataset_text_field="text",
-        max_seq_length=MAX_SEQ_LENGTH,
         args=training_args,
-        packing=True,
-        formatting_func=formatting_func,
+        packing=True,  # 确保与 SFTConfig 一致
     )
-    
+
     logger.info("Starting training")
     trainer.train()
     logger.info("Training completed")
-    
+
     logger.info("Saving model")
     trainer.save_model(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
