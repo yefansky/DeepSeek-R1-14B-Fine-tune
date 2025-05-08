@@ -1,21 +1,54 @@
-import json  # 添加这行导入
+import json
+import os
+import glob
 import torch
 from unsloth import FastLanguageModel
 from transformers import AutoTokenizer
+import logging
+from peft import PeftModel
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def load_model_and_tokenizer(model_path):
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = model_path,
-        max_seq_length = 32768,
-        dtype = torch.bfloat16,
-        load_in_4bit = True,
+    # Load the checkpoint’s tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    
+    # Get the vocabulary size from the tokenizer
+    vocab_size = len(tokenizer)  # Dynamically retrieve vocab size
+
+    # Load the base model
+    #base_model_name = "unsloth/deepseek-r1-distill-qwen-14b-unsloth-bnb-4bit"
+    base_model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+    model, _ = FastLanguageModel.from_pretrained(
+        model_name=base_model_name,
+        max_seq_length=32768,
+        dtype=torch.bfloat16,
+        load_in_4bit=True
     )
+
+    # Resize the base model’s embeddings to match the checkpoint’s vocab size
+    model.resize_token_embeddings(vocab_size)
+
+    # Load the LoRA adapters
+    model = PeftModel.from_pretrained(
+        model,
+        model_path,
+        is_trainable=False
+    )
+
     return model, tokenizer
 
-def generate_response(model, tokenizer, prompt):
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True).to("cuda")
+def generate_response(model, tokenizer, messages):
+    """Generate response using chat template"""
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt"
+    ).to("cuda")
     outputs = model.generate(
-        **inputs,
+        input_ids=inputs,
         max_new_tokens=512,
         temperature=0.3,
         do_sample=True,
@@ -24,116 +57,118 @@ def generate_response(model, tokenizer, prompt):
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 def extract_tool_call(response):
-    """提取工具调用内容并进行验证"""
+    """Extract and validate tool call"""
     start_tag = "<tool_call>"
     end_tag = "</tool_call>"
     start_idx = response.find(start_tag)
     end_idx = response.find(end_tag)
     
     if start_idx == -1 or end_idx == -1:
-        raise ValueError("未检测到工具调用标记")
+        raise ValueError("No tool call tags detected")
     
     json_str = response[start_idx+len(start_tag):end_idx].strip()
     try:
         tool_call = json.loads(json_str)
     except json.JSONDecodeError:
-        raise ValueError("工具调用内容不是有效的JSON格式")
+        raise ValueError("Tool call content is not valid JSON")
     
-    # 验证必需字段
     required_fields = ["name", "arguments"]
     for field in required_fields:
         if field not in tool_call:
-            raise ValueError(f"缺少必需字段: {field}")
+            raise ValueError(f"Missing required field: {field}")
     
     return tool_call
 
 def test_tool_calling(model_path):
-    # 加载模型
+    # Load model
     model, tokenizer = load_model_and_tokenizer(model_path)
     
-    # 工具定义示例
+    # Tool definition
     tools = [
         {
             "name": "get_weather",
-            "description": "获取指定城市的天气信息",
+            "description": "Get weather information for a city",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "city": {
-                        "type": "string",
-                        "description": "城市名称"
-                    },
-                    "date": {
-                        "type": "string",
-                        "description": "查询日期（YYYY-MM-DD格式）",
-                        "default": "今天"
-                    }
+                    "city": {"type": "string", "description": "City name"},
+                    "date": {"type": "string", "description": "Query date (YYYY-MM-DD)", "default": "today"}
                 },
                 "required": ["city"]
             }
         }
     ]
     
-    # 测试案例
+    # System prompt
+    system_prompt = f"""You are an assistant that supports tool calling. Available tools:
+{json.dumps(tools, indent=2, ensure_ascii=False)}
+
+Respond with tool calls in this format:
+<tool_call>{{"name": "tool_name", "arguments": {{"param": "value"}}}}</tool_call>
+
+If no tool is needed, return the answer directly."""
+    
+    # Test cases
     test_cases = [
         {
-            "instruction": "你需要使用提供的工具来回答问题",
-            "input": "请问杭州明天的天气怎么样？",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "human", "content": "What's the weather in Hangzhou tomorrow?"}
+            ],
             "expected": {
                 "name": "get_weather",
-                "arguments": {
-                    "city": "杭州",
-                    "date": "明天"
-                }
+                "arguments": {"city": "杭州", "date": "明天"}
             }
         },
         {
-            "instruction": "请使用合适的工具进行查询",
-            "input": "帮我查下纽约的天气情况",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "human", "content": "Check New York's weather"},
+                {"role": "model", "content": "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"纽约\"}}</tool_call>"},
+                {"role": "human", "content": "What about the day after tomorrow?"}
+            ],
             "expected": {
                 "name": "get_weather",
-                "arguments": {
-                    "city": "纽约"
-                }
+                "arguments": {"city": "纽约", "date": "后天"}
             }
         }
     ]
 
     for i, case in enumerate(test_cases):
-        print(f"\n=== 测试案例 {i+1} ===")
+        print(f"\n=== Test Case {i+1} ===")
         
-        # 构建prompt
-        prompt = f"""Instruction: {case['instruction']}
-可用的工具定义：
-{json.dumps(tools, indent=2, ensure_ascii=False)}
-
-Input: {case['input']}
-Output:"""
-        
-        # 生成响应
-        response = generate_response(model, tokenizer, prompt)
-        print("\n完整模型输出：")
+        # Generate response
+        response = generate_response(model, tokenizer, case["messages"])
+        print("\nModel Output:")
         print(response)
         
         try:
-            # 提取并验证工具调用
+            # Extract and validate tool call
             tool_call = extract_tool_call(response)
             
-            # 验证结果
-            assert tool_call["name"] == case["expected"]["name"], "工具名称不匹配"
-            
-            # 验证参数
+            # Verify results
+            assert tool_call["name"] == case["expected"]["name"], "Tool name mismatch"
             for param, value in case["expected"]["arguments"].items():
-                assert param in tool_call["arguments"], f"缺少参数: {param}"
-                assert tool_call["arguments"][param] == value, f"参数值不匹配: {param}"
+                assert param in tool_call["arguments"], f"Missing parameter: {param}"
+                assert tool_call["arguments"][param] == value, f"Parameter value mismatch: {param}"
             
-            print("\n✅ 测试通过")
-            print("提取到的工具调用：")
+            print("\n✅ Test Passed")
+            print("Extracted Tool Call:")
             print(json.dumps(tool_call, indent=2, ensure_ascii=False))
             
         except Exception as e:
-            print(f"\n❌ 测试失败：{str(e)}")
+            print(f"\n❌ Test Failed: {str(e)}")
 
 if __name__ == "__main__":
-    model_path = "./fine_tuned_model"  # 修改为你的模型路径
+    OUTPUT_DIR = "./fine_tuned_model"  # Base directory for checkpoints
+    
+    # Find the latest checkpoint
+    checkpoint_dirs = glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*"))
+    if checkpoint_dirs:
+        model_path = max(checkpoint_dirs, key=lambda x: int(x.split("checkpoint-")[-1]))
+        logger.info(f"Found latest checkpoint: {model_path}")
+    else:
+        logger.error("No checkpoints found in {OUTPUT_DIR}")
+        raise FileNotFoundError(f"No checkpoints found in {OUTPUT_DIR}")
+    
     test_tool_calling(model_path)

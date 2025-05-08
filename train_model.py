@@ -5,7 +5,7 @@ import time
 from unsloth import FastLanguageModel
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
-from transformers import TrainingArguments, DataCollatorForLanguageModeling
+import glob
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -35,10 +35,10 @@ QWEN_CHAT_TEMPLATE = (
     "<|im_start|>tool\n{{ message['content'] }}<|im_end|>\n"
     "{% endif %}"
     "{% endfor %}"
+    "{% if add_generation_prompt %}<|im_start|>assistant {% endif %}"
 )
 
 def load_model_and_tokenizer(max_retries=3, retry_delay=5):
-    """Load model and tokenizer with LoRA adapters."""
     logger.info(f"Loading model {MODEL_NAME}")
     for attempt in range(1, max_retries + 1):
         try:
@@ -51,26 +51,36 @@ def load_model_and_tokenizer(max_retries=3, retry_delay=5):
             )
             logger.info("Model and tokenizer loaded successfully")
 
-            # Check tokenizer configuration
-            logger.info(f"Tokenizer EOS token: {tokenizer.eos_token}")
-            logger.info(f"Tokenizer pad token: {tokenizer.pad_token}")
-            logger.info(f"Tokenizer chat template: {getattr(tokenizer, 'chat_template', None)}")
+            # 确保 model_type 和 vocab_size
+            model.config.model_type = "qwen2"
+            model.config.vocab_size = len(tokenizer)  # 设置初始 vocab_size
 
-            # Ensure correct EOS token
-            if tokenizer.eos_token is None or tokenizer.eos_token != "<|im_end|>":
-                logger.warning("EOS token is missing or incorrect, setting to <|im_end|>")
-                tokenizer.eos_token = "<|im_end|>"
+            # 添加特殊标记
+            special_tokens = {
+                "additional_special_tokens": [
+                    "<tools>",
+                    "</tools>",
+                    "<tool_call>",
+                    "</tool_call>",
+                    "<tool_response>",
+                    "</tool_response>"
+                ]
+            }
+            logger.info("Adding special tokens to tokenizer")
+            num_added_tokens = tokenizer.add_special_tokens(special_tokens)
+            logger.info(f"Added {num_added_tokens} special tokens: {special_tokens['additional_special_tokens']}")
 
-            # Ensure pad token is set
-            if tokenizer.pad_token is None:
-                logger.warning("Pad token is missing, setting to EOS token (<|im_end|>)")
-                tokenizer.pad_token = tokenizer.eos_token
+            # 调整模型嵌入层并更新 config
+            logger.info("Resizing model token embeddings")
+            model.resize_token_embeddings(len(tokenizer))
+            # model.config.vocab_size = len(tokenizer)  # 更新 vocab_size
+            logger.info(f"Model token embeddings resized to {len(tokenizer)}")
 
-            # Set Qwen chat template
+            # 设置 Qwen chat template
             logger.info("Setting Qwen chat template")
             tokenizer.chat_template = QWEN_CHAT_TEMPLATE
 
-            # Apply LoRA adapters
+            # 应用 LoRA 适配器
             logger.info("Applying LoRA adapters")
             model = FastLanguageModel.get_peft_model(
                 model,
@@ -86,24 +96,12 @@ def load_model_and_tokenizer(max_retries=3, retry_delay=5):
             )
             logger.info("LoRA adapters applied successfully")
 
-            # Log parameter counts
-            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            total_params = sum(p.numel() for p in model.parameters())
-            logger.info(f"Total parameters: {total_params:,}")
-            logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params / total_params * 100:.2f}%)")
-
             return model, tokenizer
-        except OSError as e:
-            logger.warning(f"Attempt {attempt} failed with OSError: {str(e)}")
-            if attempt == max_retries:
-                logger.error(f"All {max_retries} attempts failed. Final error: {str(e)}")
-                raise
-            logger.info(f"Retrying in {retry_delay} seconds...")
-            time.sleep(retry_delay)
         except Exception as e:
-            logger.error(f"Unexpected error during attempt {attempt}: {str(e)}")
-            raise
-    raise Exception("Failed to load model after retries")
+            logger.error(f"Attempt {attempt} failed: {str(e)}")
+            if attempt == max_retries:
+                raise
+            time.sleep(retry_delay)
 
 def prepare_dataset():
     """Load the dataset."""
@@ -221,19 +219,18 @@ def custom_data_collator(tokenizer):
     return collate_fn
 
 def train(model, tokenizer, dataset):
-    """Train the model."""
     training_args = SFTConfig(
         output_dir=OUTPUT_DIR,
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=4,
         learning_rate=LEARNING_RATE,
         num_train_epochs=EPOCHS,
-        logging_steps=10,
-        save_steps=100,
+        logging_steps=1,
+        save_steps=5,
+        save_strategy="steps",
+        save_total_limit=5,
         fp16=False,
         bf16=True,
-        save_strategy="steps",
-        save_total_limit=2,
         optim="adamw_bnb_8bit",
         lr_scheduler_type="cosine",
         warmup_steps=100,
@@ -243,7 +240,19 @@ def train(model, tokenizer, dataset):
         neftune_noise_alpha=5,
         dataset_kwargs={"skip_prepare_dataset": True},
         remove_unused_columns=False,
+        resume_from_checkpoint=True,
     )
+        
+    # 检查现有检查点
+    checkpoint_dirs = glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*"))
+    resume_from_checkpoint = None
+    if checkpoint_dirs:
+        # 找到最新检查点
+        latest_checkpoint = max(checkpoint_dirs, key=lambda x: int(x.split("checkpoint-")[-1]))
+        logger.info(f"Found existing checkpoint: {latest_checkpoint}")
+        resume_from_checkpoint = latest_checkpoint
+    else:
+        logger.info("No existing checkpoints found, starting from scratch")        
 
     trainer = SFTTrainer(
         model=model,
@@ -254,10 +263,15 @@ def train(model, tokenizer, dataset):
     )
 
     logger.info("Starting training")
-    trainer.train()
+    try:
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        #trainer.train()
+    except Exception as e:
+        logger.error(f"Training failed: {str(e)}")
+        raise
     logger.info("Training completed")
 
-    logger.info("Saving model")
+    logger.info("Saving final model")
     trainer.save_model(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
 
