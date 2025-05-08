@@ -18,7 +18,6 @@ def load_model_and_tokenizer(model_path):
     vocab_size = len(tokenizer)  # Dynamically retrieve vocab size
 
     # Load the base model
-    #base_model_name = "unsloth/deepseek-r1-distill-qwen-14b-unsloth-bnb-4bit"
     base_model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
     model, _ = FastLanguageModel.from_pretrained(
         model_name=base_model_name,
