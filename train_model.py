@@ -25,14 +25,13 @@ MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
 DATASET_NAME = "Jofthomas/hermes-function-calling-thinking-V1"
 OUTPUT_DIR = os.path.join(".", "fine_tuned_model")
 MAX_SEQ_LENGTH = 1024
-LORA_RANK = 8
+LORA_RANK = 16
 LORA_ALPHA = 32
-BATCH_SIZE = 3
+BATCH_SIZE = 4
 LEARNING_RATE = 2e-5
 EPOCHS = 3
-VALIDATION_SPLIT = 0.1
-EVAL_SAMPLES = 10 
-TARGET_MODULES=["q_proj", "k_proj", "v_proj", "o_proj"]#, "gate_proj", "up_proj", "down_proj"]
+VALIDATION_SPLIT = 0.003
+EVAL_SAMPLES = 10
 
 # Qwen 聊天模板
 QWEN_CHAT_TEMPLATE = (
@@ -94,7 +93,7 @@ def load_model_and_tokenizer(max_retries=3, retry_delay=5):
                 lora_alpha=LORA_ALPHA,
                 lora_dropout=0.05,
                 bias="none",
-                target_modules=TARGET_MODULES,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
                 modules_to_save=["lm_head", "embed_tokens"],
                 use_gradient_checkpointing=True,
                 random_state=3407,
@@ -218,38 +217,36 @@ def custom_data_collator(tokenizer):
 def create_compute_metrics(tokenizer):
     def compute_metrics(eval_pred):
         predictions, labels = eval_pred
-        logger.info("compute_metrics called!")
 
-        # 调试：检查输入
+        # predictions 是 logits，形状 (batch_size, seq_len, vocab_size)
+        # labels 是 token IDs，形状 (batch_size, seq_len)
         if isinstance(predictions, np.ndarray):
             predictions = torch.tensor(predictions)
         if isinstance(labels, np.ndarray):
             labels = torch.tensor(labels)
-        logger.debug(f"Predictions shape: {predictions.shape}, Labels shape: {labels.shape}")
 
-        # 检查 logits 是否包含 inf 或 nan
-        if torch.isinf(predictions).any() or torch.isnan(predictions).any():
-            logger.warning("Predictions contain inf or nan values!")
-            predictions = torch.nan_to_num(predictions, nan=0.0, posinf=1e9, neginf=-1e9)
-
+        # 计算交叉熵损失
+        # 展平 predictions 和 labels 以便计算
         batch_size, seq_len, vocab_size = predictions.shape
-        predictions = predictions.view(-1, vocab_size)
-        labels = labels.view(-1)
+        predictions = predictions.view(-1, vocab_size)  # (batch_size * seq_len, vocab_size)
+        labels = labels.view(-1)  # (batch_size * seq_len)
 
+        # 创建掩码，忽略 -100 和 pad_token_id
         valid_mask = (labels != -100) & (labels != tokenizer.pad_token_id)
+
+        # 仅对有效 token 计算交叉熵
         valid_predictions = predictions[valid_mask]
         valid_labels = labels[valid_mask]
 
-        logger.debug(f"Valid labels count: {valid_labels.numel()}")
-        if valid_labels.numel() == 0:
-            logger.warning("No valid labels found in batch!")
+        if valid_labels.numel() == 0:  # 防止空标签
             cross_entropy = 0.0
         else:
             cross_entropy = torch.nn.functional.cross_entropy(
                 valid_predictions, valid_labels, reduction="mean"
             ).item()
 
-        pred_tokens = torch.argmax(predictions, dim=-1)
+        # （可选）计算 token 预测准确率
+        pred_tokens = torch.argmax(predictions, dim=-1)  # (batch_size * seq_len)
         correct_tokens = (pred_tokens == labels) & valid_mask
         total_valid_tokens = valid_mask.sum().item()
         token_accuracy = correct_tokens.sum().item() / total_valid_tokens if total_valid_tokens > 0 else 0.0
@@ -260,30 +257,6 @@ def create_compute_metrics(tokenizer):
         }
     return compute_metrics
 
-# 自定义 SFTTrainer 类
-class CustomSFTTrainer(SFTTrainer):
-    def evaluate(self, eval_dataset=None, ignore_keys_for_eval=None, **kwargs):
-        # 如果未提供 eval_dataset，使用 trainer 的 eval_dataset
-        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-        if eval_dataset is None:
-            logger.error("No eval_dataset provided for evaluation")
-            raise ValueError("eval_dataset is required for evaluation")
-
-        # 随机抽取 EVAL_SAMPLES 个样本
-        if len(eval_dataset) < EVAL_SAMPLES:
-            logger.warning(f"Eval dataset has only {len(eval_dataset)} samples, using all samples")
-            eval_subset = eval_dataset
-        else:
-            # 使用固定种子打乱数据集并选取前 EVAL_SAMPLES 个样本
-            eval_subset = eval_dataset.shuffle(seed=3407).select(range(EVAL_SAMPLES))
-            logger.info(f"Selected {len(eval_subset)} samples for evaluation: {eval_subset[0]}")
-
-        # 调用父类的 evaluate 方法，传入随机子集
-        return super().evaluate(
-            eval_dataset=eval_subset,
-            **kwargs
-        )
-
 def train(model, tokenizer, train_dataset, eval_dataset):
     training_args = SFTConfig(
         output_dir=OUTPUT_DIR,
@@ -292,10 +265,10 @@ def train(model, tokenizer, train_dataset, eval_dataset):
         gradient_accumulation_steps=4,
         learning_rate=LEARNING_RATE,
         num_train_epochs=EPOCHS,
-        logging_steps=5,
-        save_steps=20,
+        logging_steps=1,
+        save_steps=100,
         save_strategy="steps",
-        save_total_limit=50,
+        save_total_limit=5,
         fp16=False,
         bf16=True,
         optim="adamw_bnb_8bit",
@@ -313,27 +286,6 @@ def train(model, tokenizer, train_dataset, eval_dataset):
         report_to="tensorboard",
         logging_dir=os.path.join(OUTPUT_DIR, "logs"),
     )
-    compute_metrics = create_compute_metrics(tokenizer)
-    
-    trainer = CustomSFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        args=training_args,
-        data_collator=custom_data_collator(tokenizer),
-        compute_metrics=compute_metrics,  # 添加 compute_metrics
-        fp16_full_eval=True,
-    )
-
-    # 初始评估
-    logger.info(f"Running initial evaluation with {EVAL_SAMPLES} samples")
-    try:
-        eval_results = trainer.evaluate()
-        logger.info(f"Initial evaluation results: {eval_results}")
-    except Exception as e:
-        logger.error(f"Initial evaluation failed: {str(e)}")
-        raise
 
     checkpoint_dirs = glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*"))
     resume_from_checkpoint = None
@@ -343,6 +295,22 @@ def train(model, tokenizer, train_dataset, eval_dataset):
         resume_from_checkpoint = latest_checkpoint
     else:
         logger.info("未找到检查点，从头开始")
+
+    compute_metrics = create_compute_metrics(tokenizer)
+    
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        args=training_args,
+        data_collator=custom_data_collator(tokenizer),
+        compute_metrics=compute_metrics,  # 添加 compute_metrics
+    )
+
+    logger.info(f"Running initial evaluation with {EVAL_SAMPLES} samples")
+    eval_results = trainer.evaluate()
+    logger.info(f"Initial evaluation results: {eval_results}")
 
     logger.info("开始训练")
     try:
