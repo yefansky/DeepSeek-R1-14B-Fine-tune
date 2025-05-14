@@ -6,10 +6,16 @@ import time
 import transformers
 import trl
 from unsloth import FastLanguageModel
-from datasets import load_dataset
+from unsloth.chat_templates import get_chat_template
+from datasets import load_dataset, Dataset
 from trl import SFTTrainer, SFTConfig
 import glob
 import numpy as np
+import re
+import logging
+import json
+
+#torch.set_num_threads(6)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,30 +30,14 @@ logger.info(f"unsloth version: {unsloth.__version__}")
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
 DATASET_NAME = "Jofthomas/hermes-function-calling-thinking-V1"
 OUTPUT_DIR = os.path.join(".", "fine_tuned_model")
-MAX_SEQ_LENGTH = 1024
+MAX_SEQ_LENGTH = 2048
 LORA_RANK = 16
 LORA_ALPHA = 32
-BATCH_SIZE = 4
-LEARNING_RATE = 2e-5
+BATCH_SIZE = 2
+LEARNING_RATE = 2e-4
 EPOCHS = 3
-VALIDATION_SPLIT = 0.003
+VALIDATION_SPLIT = 0.005
 EVAL_SAMPLES = 10
-
-# Qwen 聊天模板
-QWEN_CHAT_TEMPLATE = (
-    "{% for message in messages %}"
-    "{% if message['role'] == 'system' %}"
-    "<|im_start|>system\n{{ message['content'] }}<|im_end|>\n"
-    "{% elif message['role'] == 'human' %}"
-    "<|im_start|>user\n{{ message['content'] }}<|im_end|>\n"
-    "{% elif message['role'] == 'model' %}"
-    "<|im_start|>assistant\n{{ message['content'] }}<|im_end|>\n"
-    "{% elif message['role'] == 'tool' %}"
-    "<|im_start|>tool\n{{ message['content'] }}<|im_end|>\n"
-    "{% endif %}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}<|im_start|>assistant {% endif %}"
-)
 
 def load_model_and_tokenizer(max_retries=3, retry_delay=5):
     logger.info(f"加载模型 {MODEL_NAME}")
@@ -62,29 +52,13 @@ def load_model_and_tokenizer(max_retries=3, retry_delay=5):
             )
             logger.info("模型和分词器加载成功")
 
-            model.config.model_type = "qwen2"
-            model.config.vocab_size = len(tokenizer)
+            #model.config.model_type = "qwen2"
+            #model.config.vocab_size = len(tokenizer)
 
-            special_tokens = {
-                "additional_special_tokens": [
-                    "<tools>",
-                    "</tools>",
-                    "<tool_call>",
-                    "</tool_call>",
-                    "<tool_response>",
-                    "</tool_response>"
-                ]
-            }
-            logger.info("向分词器添加特殊 token")
-            num_added_tokens = tokenizer.add_special_tokens(special_tokens)
-            logger.info(f"添加了 {num_added_tokens} 个特殊 token")
-
-            logger.info("调整模型 token 嵌入")
-            model.resize_token_embeddings(len(tokenizer))
-            logger.info(f"模型 token 嵌入调整为 {len(tokenizer)}")
-
-            logger.info("设置 Qwen 聊天模板")
-            tokenizer.chat_template = QWEN_CHAT_TEMPLATE
+            tokenizer = get_chat_template(
+                tokenizer,
+                chat_template="qwen-2.5",
+            )
 
             logger.info("应用 LoRA 适配器")
             model = FastLanguageModel.get_peft_model(
@@ -122,89 +96,158 @@ def prepare_dataset():
     dataset = dataset.train_test_split(test_size=VALIDATION_SPLIT, seed=3407)
     return dataset["train"], dataset["test"]
 
-def preprocess_dataset(dataset, tokenizer):
+logger = logging.getLogger(__name__)
+
+def preprocess_dataset(dataset: Dataset, tokenizer, max_seq_length: int = 2048):
     def format_conversation(examples):
         input_texts = []
         label_texts = []
         skipped_count = 0
 
-        for example in examples["conversations"]:
+        for idx, example in enumerate(examples["conversations"]):
             if not isinstance(example, list) or not example:
-                logger.warning(f"无效的对话格式: {example}")
+                logger.warning(f"样本 {idx} 无效的对话格式: {example}")
                 skipped_count += 1
                 continue
 
+            # 检查样本内容
+            logger.debug(f"样本 {idx} 原始内容: {example}")
+
+            # 转换角色：human -> user, model -> assistant
+            role_mapping = {
+                "human": "user",
+                "model": "assistant",
+                "assistant": "assistant",
+                "user": "user",
+                "system": "system",
+                "tool": "tool"
+            }
+            try:
+                example = [
+                    {"role": role_mapping.get(msg["role"], msg["role"]), "content": msg["content"]}
+                    for msg in example
+                ]
+            except KeyError as e:
+                logger.error(f"样本 {idx} 缺少 role 或 content: {example}")
+                skipped_count += 1
+                continue
+
+            # 检查转换后的角色
+            roles = set(msg["role"] for msg in example)
+            logger.debug(f"样本 {idx} 转换后角色: {roles}")
+            if any(role not in ["system", "user", "assistant", "tool"] for role in roles):
+                logger.warning(f"样本 {idx} 包含不受支持的角色: {roles}")
+                skipped_count += 1
+                continue
+
+            found_assistant = False
             for i in range(len(example)):
-                if example[i]["role"] == "model":
+                if example[i]["role"] == "assistant":
+                    found_assistant = True
                     input_messages = example[:i]
-                    label_message = [example[i]]
+                    label_message = example[i]
 
                     try:
-                        input_text = tokenizer.apply_chat_template(input_messages, tokenize=False)
-                        label_text = tokenizer.apply_chat_template(label_message, tokenize=False)
+                        # 检查消息内容
+                        logger.debug(f"样本 {idx} 输入消息: {input_messages}")
+                        logger.debug(f"样本 {idx} 标签消息: {label_message}")
+
+                        input_text = tokenizer.apply_chat_template(
+                            input_messages,
+                            tokenize=False,
+                            add_generation_prompt=True
+                        )
+                        label_text = label_message['content'] + "\n<|im_end|>"
+
+                        if not input_text or not label_text:
+                            logger.warning(f"样本 {idx} 生成空文本: input_text={input_text}, label_text={label_text}")
+                            skipped_count += 1
+                            continue
+
                         input_texts.append(input_text)
                         label_texts.append(label_text)
+                        logger.debug(f"样本 {idx} 生成成功: input_text={input_text[:50]}..., label_text={label_text[:50]}...")
                     except Exception as e:
-                        logger.error(f"应用聊天模板出错: {str(e)}")
+                        logger.error(f"样本 {idx} 应用聊天模板出错: {str(e)}")
+                        logger.error(f"输入消息: {input_messages}")
+                        logger.error(f"标签消息: {label_message}")
                         skipped_count += 1
                         continue
 
+            if not found_assistant:
+                logger.warning(f"样本 {idx} 无 assistant 角色: {example}")
+                skipped_count += 1
+
         logger.info(f"跳过了 {skipped_count} 个无效样本")
-        return {"input_text": input_texts, "label_text": label_texts}
+        tokenized_inputs = tokenizer(
+            input_texts,
+            padding="max_length",
+            truncation=True,
+            max_length=max_seq_length,
+            return_tensors="pt"
+        )
+        tokenized_labels = tokenizer(
+            label_texts,
+            padding="max_length",
+            truncation=True,
+            max_length=max_seq_length,
+            return_tensors="pt"
+        )
+
+        return {
+            "input_ids": tokenized_inputs["input_ids"],
+            "attention_mask": tokenized_inputs["attention_mask"],
+            "labels": tokenized_labels["input_ids"],
+        }
 
     logger.info("预处理数据集")
+    print("首条样本:", dataset[0]["conversations"]) 
+
     processed_dataset = dataset.map(
         format_conversation,
         batched=True,
-        remove_columns=["conversations"]
+        remove_columns=["conversations"],
+        load_from_cache_file=False
     )
     processed_dataset = processed_dataset.flatten()
     processed_dataset = processed_dataset.filter(
-        lambda x: x["input_text"] is not None and x["label_text"] is not None
+        lambda x: len(x["input_ids"]) > 0 and len(x["labels"]) > 0
     )
+
     logger.info(f"处理后的数据集大小: {len(processed_dataset)}")
-    if len(processed_dataset) > 0:
-        logger.info(f"处理后的数据集样本: {processed_dataset[0]}")
     return processed_dataset
 
-def custom_data_collator(tokenizer):
-    def collate_fn(examples):
-        input_texts = [example["input_text"] for example in examples]
-        label_texts = [example["label_text"] for example in examples]
+class CustomDataCollator:
+    def __init__(self, tokenizer, max_length):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+    
+    def __call__(self, examples):
+        input_ids = [torch.tensor(example["input_ids"]) for example in examples]
+        attention_mask = [torch.tensor(example["attention_mask"]) for example in examples]
+        labels = [torch.tensor(example["labels"]) for example in examples]
 
-        input_encodings = tokenizer(input_texts, padding=True, truncation=True, max_length=MAX_SEQ_LENGTH, return_tensors="pt")
-        label_encodings = tokenizer(label_texts, padding=True, truncation=True, max_length=MAX_SEQ_LENGTH, return_tensors="pt")
+        # Ensure all tensors are truncated to max_length
+        input_ids = [ids[:self.max_length] for ids in input_ids]
+        attention_mask = [mask[:self.max_length] for mask in attention_mask]
+        labels = [lbl[:self.max_length] for lbl in labels]
 
-        batch_size = len(examples)
-        input_ids = []
-        attention_mask = []
-        labels = []
-
-        for i in range(batch_size):
-            input_ids_i = input_encodings["input_ids"][i]
-            label_ids_i = label_encodings["input_ids"][i]
-
-            combined_ids = torch.cat([input_ids_i, label_ids_i])
-            combined_mask = torch.cat([input_encodings["attention_mask"][i], label_encodings["attention_mask"][i]])
-
-            if combined_ids.size(0) > MAX_SEQ_LENGTH:
-                combined_ids = combined_ids[:MAX_SEQ_LENGTH]
-                combined_mask = combined_mask[:MAX_SEQ_LENGTH]
-
-            label_length = label_ids_i.size(0)
-            input_length = input_ids_i.size(0)
-            total_length = combined_ids.size(0)
-            labels_i = torch.full_like(combined_ids, -100)
-            if input_length < total_length:
-                labels_i[-label_length:] = combined_ids[-label_length:]
-
-            input_ids.append(combined_ids)
-            attention_mask.append(combined_mask)
-            labels.append(labels_i)
-
-        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
-        attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
-        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
+        # Pad sequences to the same length
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, 
+            batch_first=True, 
+            padding_value=self.tokenizer.pad_token_id
+        )
+        attention_mask = torch.nn.utils.rnn.pad_sequence(
+            attention_mask, 
+            batch_first=True, 
+            padding_value=0
+        )
+        labels = torch.nn.utils.rnn.pad_sequence(
+            labels, 
+            batch_first=True, 
+            padding_value=-100
+        )
 
         return {
             "input_ids": input_ids,
@@ -212,44 +255,49 @@ def custom_data_collator(tokenizer):
             "labels": labels
         }
 
-    return collate_fn
+def custom_data_collator(tokenizer):
+    return CustomDataCollator(tokenizer, MAX_SEQ_LENGTH)
 
 def create_compute_metrics(tokenizer):
     def compute_metrics(eval_pred):
         predictions, labels = eval_pred
 
-        # predictions 是 logits，形状 (batch_size, seq_len, vocab_size)
-        # labels 是 token IDs，形状 (batch_size, seq_len)
+        # predictions: (batch_size, seq_len, vocab_size)
+        # labels: (batch_size, seq_len)
         if isinstance(predictions, np.ndarray):
             predictions = torch.tensor(predictions)
         if isinstance(labels, np.ndarray):
             labels = torch.tensor(labels)
 
-        # 计算交叉熵损失
-        # 展平 predictions 和 labels 以便计算
         batch_size, seq_len, vocab_size = predictions.shape
-        predictions = predictions.view(-1, vocab_size)  # (batch_size * seq_len, vocab_size)
-        labels = labels.view(-1)  # (batch_size * seq_len)
+        cross_entropy = 0.0
+        total_correct = 0
+        total_valid_tokens = 0
 
-        # 创建掩码，忽略 -100 和 pad_token_id
-        valid_mask = (labels != -100) & (labels != tokenizer.pad_token_id)
+        # 逐批处理 logits
+        for i in range(batch_size):
+            pred = predictions[i]  # (seq_len, vocab_size)
+            lbl = labels[i]       # (seq_len)
 
-        # 仅对有效 token 计算交叉熵
-        valid_predictions = predictions[valid_mask]
-        valid_labels = labels[valid_mask]
+            # 创建掩码，忽略 -100 和 pad_token_id
+            valid_mask = (lbl != -100) & (lbl != tokenizer.pad_token_id)
+            valid_pred = pred[valid_mask]
+            valid_lbl = lbl[valid_mask]
 
-        if valid_labels.numel() == 0:  # 防止空标签
-            cross_entropy = 0.0
-        else:
-            cross_entropy = torch.nn.functional.cross_entropy(
-                valid_predictions, valid_labels, reduction="mean"
-            ).item()
+            if valid_lbl.numel() > 0:
+                # 计算交叉熵
+                ce = torch.nn.functional.cross_entropy(valid_pred, valid_lbl, reduction="mean")
+                cross_entropy += ce.item()
 
-        # （可选）计算 token 预测准确率
-        pred_tokens = torch.argmax(predictions, dim=-1)  # (batch_size * seq_len)
-        correct_tokens = (pred_tokens == labels) & valid_mask
-        total_valid_tokens = valid_mask.sum().item()
-        token_accuracy = correct_tokens.sum().item() / total_valid_tokens if total_valid_tokens > 0 else 0.0
+                # 计算 token 准确率
+                pred_tokens = torch.argmax(valid_pred, dim=-1)
+                correct_tokens = (pred_tokens == valid_lbl).sum().item()
+                total_correct += correct_tokens
+                total_valid_tokens += valid_mask.sum().item()
+
+        # 平均交叉熵
+        cross_entropy = cross_entropy / batch_size if batch_size > 0 else 0.0
+        token_accuracy = total_correct / total_valid_tokens if total_valid_tokens > 0 else 0.0
 
         return {
             "cross_entropy": cross_entropy,
@@ -261,14 +309,13 @@ def train(model, tokenizer, train_dataset, eval_dataset):
     training_args = SFTConfig(
         output_dir=OUTPUT_DIR,
         per_device_train_batch_size=BATCH_SIZE,
-        per_device_eval_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=4,
+        per_device_eval_batch_size=1,
         learning_rate=LEARNING_RATE,
         num_train_epochs=EPOCHS,
-        logging_steps=1,
+        logging_steps=10,
         save_steps=100,
         save_strategy="steps",
-        save_total_limit=5,
+        save_total_limit=50,
         fp16=False,
         bf16=True,
         optim="adamw_bnb_8bit",
@@ -285,6 +332,7 @@ def train(model, tokenizer, train_dataset, eval_dataset):
         eval_strategy="steps",
         report_to="tensorboard",
         logging_dir=os.path.join(OUTPUT_DIR, "logs"),
+        gradient_accumulation_steps=4,
     )
 
     checkpoint_dirs = glob.glob(os.path.join(OUTPUT_DIR, "checkpoint-*"))
@@ -297,6 +345,7 @@ def train(model, tokenizer, train_dataset, eval_dataset):
         logger.info("未找到检查点，从头开始")
 
     compute_metrics = create_compute_metrics(tokenizer)
+    eval_dataset = eval_dataset.select(range(min(len(eval_dataset), 10)))
     
     trainer = SFTTrainer(
         model=model,

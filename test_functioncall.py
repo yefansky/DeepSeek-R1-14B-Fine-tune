@@ -6,54 +6,69 @@ from unsloth import FastLanguageModel
 from transformers import AutoTokenizer
 import logging
 from peft import PeftModel
+from unsloth.chat_templates import get_chat_template
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def load_model_and_tokenizer(model_path):
-    # Load the checkpoint’s tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    
-    # Get the vocabulary size from the tokenizer
-    vocab_size = len(tokenizer)  # Dynamically retrieve vocab size
-
-    # Load the base model
-    base_model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
-    model, _ = FastLanguageModel.from_pretrained(
-        model_name=base_model_name,
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_path,#base_model_name,
         max_seq_length=32768,
         dtype=torch.bfloat16,
         load_in_4bit=True
     )
 
-    # Resize the base model’s embeddings to match the checkpoint’s vocab size
-    model.resize_token_embeddings(vocab_size)
-
-    # Load the LoRA adapters
-    model = PeftModel.from_pretrained(
-        model,
-        model_path,
-        is_trainable=False
+    tokenizer = get_chat_template(
+        tokenizer,
+        chat_template="qwen-2.5",
     )
 
     return model, tokenizer
 
 def generate_response(model, tokenizer, messages):
-    """Generate response using chat template"""
-    inputs = tokenizer.apply_chat_template(
+    # 步骤 1: 应用聊天模板，生成格式化字符串
+    input_text = tokenizer.apply_chat_template(
         messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_tensors="pt"
-    ).to("cuda")
-    outputs = model.generate(
-        input_ids=inputs,
-        max_new_tokens=512,
-        temperature=0.3,
-        do_sample=True,
-        pad_token_id=tokenizer.eos_token_id
+        tokenize=False,  # 输出字符串
+        add_generation_prompt=True  # 添加生成提示
     )
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    # 步骤 2: 手动 token 化
+    inputs = tokenizer(
+        input_text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048,  # 与训练时的 MAX_SEQ_LENGTH 一致
+        padding=True
+    ).to("cuda")
+    
+    input_length = inputs["input_ids"].shape[1]
+    
+    # 步骤 3: 生成回复
+    outputs = model.generate(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        max_new_tokens=512,
+        temperature=0.9,
+        top_p=0.9,
+        repetition_penalty=1.2,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id
+    )
+    
+    output_length = outputs.shape[1]
+    
+    # 步骤 4: 截断输入部分，仅解码新生成内容
+    if output_length <= input_length:
+        print("错误：未生成新内容！")
+        print("完整输出:", tokenizer.decode(outputs[0], skip_special_tokens=False))
+        return ""
+    
+    generated_ids = outputs[0][input_length:]
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    
+    return generated_text
 
 def extract_tool_call(response):
     """Extract and validate tool call"""
@@ -81,6 +96,18 @@ def extract_tool_call(response):
 def test_tool_calling(model_path):
     # Load model
     model, tokenizer = load_model_and_tokenizer(model_path)
+
+    test_text = "<tools>test<tool_call></tool_call></tools>"
+    test_encodings = tokenizer(
+        test_text,
+        add_special_tokens=False,
+        return_offsets_mapping=True
+    )
+    logger.info("分词测试结果:")
+    logger.info(f"输入文本: {test_text}")
+    logger.info(f"Tokenized IDs: {test_encodings['input_ids']}")
+    logger.info(f"解码结果: {tokenizer.decode(test_encodings['input_ids'])}")
+    logger.info(f"偏移映射: {test_encodings['offset_mapping']}")
     
     # Tool definition
     tools = [
@@ -112,7 +139,7 @@ If no tool is needed, return the answer directly."""
         {
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "human", "content": "What's the weather in Hangzhou tomorrow?"}
+                {"role": "user", "content": "What's the weather in Hangzhou tomorrow?"}
             ],
             "expected": {
                 "name": "get_weather",
@@ -122,9 +149,9 @@ If no tool is needed, return the answer directly."""
         {
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "human", "content": "Check New York's weather"},
-                {"role": "model", "content": "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"纽约\"}}</tool_call>"},
-                {"role": "human", "content": "What about the day after tomorrow?"}
+                {"role": "user", "content": "Check New York's weather"},
+                {"role": "assistant", "content": "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"纽约\"}}</tool_call>"},
+                {"role": "user", "content": "What about the day after tomorrow?"}
             ],
             "expected": {
                 "name": "get_weather",
@@ -170,4 +197,5 @@ if __name__ == "__main__":
         logger.error("No checkpoints found in {OUTPUT_DIR}")
         raise FileNotFoundError(f"No checkpoints found in {OUTPUT_DIR}")
     
+    #model_path = os.path.join(OUTPUT_DIR, "checkpoint-50")
     test_tool_calling(model_path)
