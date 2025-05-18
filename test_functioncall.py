@@ -7,14 +7,17 @@ from transformers import AutoTokenizer
 import logging
 from peft import PeftModel
 from unsloth.chat_templates import get_chat_template
+import json5
+
+MAX_SEQ_LENGTH = 2048
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def load_model_and_tokenizer(model_path):
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_path,#base_model_name,
-        max_seq_length=32768,
+        model_name=model_path,
+        max_seq_length=MAX_SEQ_LENGTH,
         dtype=torch.bfloat16,
         load_in_4bit=True
     )
@@ -39,7 +42,7 @@ def generate_response(model, tokenizer, messages):
         input_text,
         return_tensors="pt",
         truncation=True,
-        max_length=2048,  # 与训练时的 MAX_SEQ_LENGTH 一致
+        max_length=MAX_SEQ_LENGTH,  # 与训练时的 MAX_SEQ_LENGTH 一致
         padding=True
     ).to("cuda")
     
@@ -82,7 +85,7 @@ def extract_tool_call(response):
     
     json_str = response[start_idx+len(start_tag):end_idx].strip()
     try:
-        tool_call = json.loads(json_str)
+        tool_call = json5.loads(json_str)
     except json.JSONDecodeError:
         raise ValueError("Tool call content is not valid JSON")
     
@@ -197,5 +200,5 @@ if __name__ == "__main__":
         logger.error("No checkpoints found in {OUTPUT_DIR}")
         raise FileNotFoundError(f"No checkpoints found in {OUTPUT_DIR}")
     
-    #model_path = os.path.join(OUTPUT_DIR, "checkpoint-50")
+    model_path = os.path.join(OUTPUT_DIR, "checkpoint-200")
     test_tool_calling(model_path)

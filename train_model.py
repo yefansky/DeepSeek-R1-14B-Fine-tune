@@ -100,8 +100,9 @@ logger = logging.getLogger(__name__)
 
 def preprocess_dataset(dataset: Dataset, tokenizer, max_seq_length: int = 2048):
     def format_conversation(examples):
-        input_texts = []
-        label_texts = []
+        input_ids_list = []
+        attention_mask_list = []
+        labels_list = []
         skipped_count = 0
 
         for idx, example in enumerate(examples["conversations"]):
@@ -110,10 +111,6 @@ def preprocess_dataset(dataset: Dataset, tokenizer, max_seq_length: int = 2048):
                 skipped_count += 1
                 continue
 
-            # 检查样本内容
-            logger.debug(f"样本 {idx} 原始内容: {example}")
-
-            # 转换角色：human -> user, model -> assistant
             role_mapping = {
                 "human": "user",
                 "model": "assistant",
@@ -132,45 +129,57 @@ def preprocess_dataset(dataset: Dataset, tokenizer, max_seq_length: int = 2048):
                 skipped_count += 1
                 continue
 
-            # 检查转换后的角色
-            roles = set(msg["role"] for msg in example)
-            logger.debug(f"样本 {idx} 转换后角色: {roles}")
-            if any(role not in ["system", "user", "assistant", "tool"] for role in roles):
-                logger.warning(f"样本 {idx} 包含不受支持的角色: {roles}")
-                skipped_count += 1
-                continue
-
             found_assistant = False
             for i in range(len(example)):
                 if example[i]["role"] == "assistant":
                     found_assistant = True
-                    input_messages = example[:i]
-                    label_message = example[i]
+                    input_messages = example[:i + 1]  # 包含 assistant 消息
 
                     try:
-                        # 检查消息内容
-                        logger.debug(f"样本 {idx} 输入消息: {input_messages}")
-                        logger.debug(f"样本 {idx} 标签消息: {label_message}")
-
-                        input_text = tokenizer.apply_chat_template(
+                        # 生成完整的对话
+                        full_text = tokenizer.apply_chat_template(
                             input_messages,
                             tokenize=False,
-                            add_generation_prompt=True
+                            add_generation_prompt=False
                         )
-                        label_text = label_message['content'] + "\n<|im_end|>"
+                        # Tokenize 完整对话
+                        tokenized = tokenizer(
+                            full_text,
+                            padding=False,
+                            truncation=True,
+                            max_length=max_seq_length,
+                            return_tensors=None
+                        )
+                        input_ids = tokenized["input_ids"]
+                        attention_mask = tokenized["attention_mask"]
+                        labels = input_ids.copy()
 
-                        if not input_text or not label_text:
-                            logger.warning(f"样本 {idx} 生成空文本: input_text={input_text}, label_text={label_text}")
-                            skipped_count += 1
-                            continue
+                        # 计算提示部分的 token 长度
+                        if example[:i]:  # 如果有非 assistant 消息
+                            prompt_text = tokenizer.apply_chat_template(
+                                example[:i],
+                                tokenize=False,
+                                add_generation_prompt=True
+                            )
+                            prompt_tokens = tokenizer(
+                                prompt_text,
+                                padding=False,
+                                truncation=True,
+                                max_length=max_seq_length,
+                                return_tensors=None
+                            )["input_ids"]
+                            n = len(prompt_tokens)
+                            labels[:n] = [-100] * n  # 屏蔽提示部分
+                        else:
+                            # 如果没有提示部分（只有 assistant），全部保留
+                            pass
 
-                        input_texts.append(input_text)
-                        label_texts.append(label_text)
-                        logger.debug(f"样本 {idx} 生成成功: input_text={input_text[:50]}..., label_text={label_text[:50]}...")
+                        input_ids_list.append(input_ids)
+                        attention_mask_list.append(attention_mask)
+                        labels_list.append(labels)
                     except Exception as e:
                         logger.error(f"样本 {idx} 应用聊天模板出错: {str(e)}")
-                        logger.error(f"输入消息: {input_messages}")
-                        logger.error(f"标签消息: {label_message}")
+                        logger.debug(f"样本内容: {example}")
                         skipped_count += 1
                         continue
 
@@ -179,41 +188,22 @@ def preprocess_dataset(dataset: Dataset, tokenizer, max_seq_length: int = 2048):
                 skipped_count += 1
 
         logger.info(f"跳过了 {skipped_count} 个无效样本")
-        tokenized_inputs = tokenizer(
-            input_texts,
-            padding="max_length",
-            truncation=True,
-            max_length=max_seq_length,
-            return_tensors="pt"
-        )
-        tokenized_labels = tokenizer(
-            label_texts,
-            padding="max_length",
-            truncation=True,
-            max_length=max_seq_length,
-            return_tensors="pt"
-        )
-
         return {
-            "input_ids": tokenized_inputs["input_ids"],
-            "attention_mask": tokenized_inputs["attention_mask"],
-            "labels": tokenized_labels["input_ids"],
+            "input_ids": input_ids_list,
+            "attention_mask": attention_mask_list,
+            "labels": labels_list
         }
 
     logger.info("预处理数据集")
-    print("首条样本:", dataset[0]["conversations"]) 
-
     processed_dataset = dataset.map(
         format_conversation,
         batched=True,
         remove_columns=["conversations"],
         load_from_cache_file=False
     )
-    processed_dataset = processed_dataset.flatten()
     processed_dataset = processed_dataset.filter(
         lambda x: len(x["input_ids"]) > 0 and len(x["labels"]) > 0
     )
-
     logger.info(f"处理后的数据集大小: {len(processed_dataset)}")
     return processed_dataset
 
@@ -223,16 +213,23 @@ class CustomDataCollator:
         self.max_length = max_length
     
     def __call__(self, examples):
-        input_ids = [torch.tensor(example["input_ids"]) for example in examples]
-        attention_mask = [torch.tensor(example["attention_mask"]) for example in examples]
-        labels = [torch.tensor(example["labels"]) for example in examples]
+        # 处理 input_ids, attention_mask, labels
+        input_ids = []
+        attention_mask = []
+        labels = []
 
-        # Ensure all tensors are truncated to max_length
-        input_ids = [ids[:self.max_length] for ids in input_ids]
-        attention_mask = [mask[:self.max_length] for mask in attention_mask]
-        labels = [lbl[:self.max_length] for lbl in labels]
+        for example in examples:
+            # 转换为张量，如果已经是张量则跳过
+            ids = torch.tensor(example["input_ids"]) if not isinstance(example["input_ids"], torch.Tensor) else example["input_ids"]
+            mask = torch.tensor(example["attention_mask"]) if not isinstance(example["attention_mask"], torch.Tensor) else example["attention_mask"]
+            lbl = torch.tensor(example["labels"]) if not isinstance(example["labels"], torch.Tensor) else example["labels"]
+            
+            # 截断到 max_length
+            input_ids.append(ids[:self.max_length])
+            attention_mask.append(mask[:self.max_length])
+            labels.append(lbl[:self.max_length])
 
-        # Pad sequences to the same length
+        # 填充序列
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, 
             batch_first=True, 
@@ -250,9 +247,9 @@ class CustomDataCollator:
         )
 
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels
+            "input_ids": input_ids.to('cuda'),
+            "attention_mask": attention_mask.to('cuda'),
+            "labels": labels.to('cuda')
         }
 
 def custom_data_collator(tokenizer):
@@ -313,9 +310,9 @@ def train(model, tokenizer, train_dataset, eval_dataset):
         learning_rate=LEARNING_RATE,
         num_train_epochs=EPOCHS,
         logging_steps=10,
-        save_steps=100,
+        save_steps=20,
         save_strategy="steps",
-        save_total_limit=50,
+        save_total_limit=200,
         fp16=False,
         bf16=True,
         optim="adamw_bnb_8bit",
@@ -328,7 +325,7 @@ def train(model, tokenizer, train_dataset, eval_dataset):
         dataset_kwargs={"skip_prepare_dataset": True},
         remove_unused_columns=False,
         do_eval=True,
-        eval_steps=10,
+        eval_steps=20,
         eval_strategy="steps",
         report_to="tensorboard",
         logging_dir=os.path.join(OUTPUT_DIR, "logs"),
@@ -353,7 +350,8 @@ def train(model, tokenizer, train_dataset, eval_dataset):
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         args=training_args,
-        data_collator=custom_data_collator(tokenizer),
+        #data_collator=custom_data_collator(tokenizer),
+        data_collator=transformers.DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
         compute_metrics=compute_metrics,  # 添加 compute_metrics
     )
 
